@@ -1,0 +1,281 @@
+local Players           = game:GetService("Players")
+local Workspace         = game:GetService("Workspace")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local LocalPlayer       = Players.LocalPlayer
+
+local cfg = {
+    enabled     = true,
+    range       = 150,
+    maxTargets  = 5,
+    skipSleep   = true,
+    autoReload  = true,
+    toggleKey   = Enum.KeyCode.X
+}
+
+local aura = {
+    counter    = 50,
+    nextShot   = 0,
+    nextSync   = 0,
+    reloading  = false,
+    stuckAmmo  = 0,
+    lastAmmo   = nil
+}
+
+local function getGun()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    for _, item in ipairs(char:GetChildren()) do
+        if item:IsA("Tool") and item:FindFirstChild("Shoot") then
+            return item
+        end
+    end
+    return nil
+end
+
+local function getTargets(myPos, maxDist)
+    local targets = {}
+    local folder = Workspace:FindFirstChild("Characters") or Workspace
+    local myChar = LocalPlayer.Character
+
+    for _, model in ipairs(folder:GetChildren()) do
+        if model:IsA("Model") and model ~= myChar and not Players:GetPlayerFromCharacter(model) then
+            local hum = model:FindFirstChildOfClass("Humanoid")
+            local isDead = (hum and hum.Health <= 0) or model:GetAttribute("Dead") == true
+            local isSleep = cfg.skipSleep and model:GetAttribute("Hibernating") == true
+
+            if not isDead and not isSleep then
+                local head = model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart")
+                if head then
+                    local dist = (head.Position - myPos).Magnitude
+                    if dist <= maxDist then
+                        table.insert(targets, {model = model, part = head, pos = head.Position, dist = dist})
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(targets, function(a, b) return a.dist < b.dist end)
+    return targets
+end
+
+local function stepSilentKillAura()
+    if not cfg.enabled then return end
+
+    local gun = getGun()
+    if not gun then return end
+
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    local now = os.clock()
+    local shootRemote = gun:FindFirstChild("Shoot")
+    local syncRemote  = gun:FindFirstChild("SyncAmmo")
+    local reloadRemote = gun:FindFirstChild("Reload")
+    if not shootRemote then return end
+
+    if syncRemote and now >= aura.nextSync then
+        aura.nextSync = now + 1.0
+        pcall(function() syncRemote:FireServer() end)
+    end
+
+    local stats = gun:FindFirstChild("Stats")
+    local fireRate = 450
+    local pellets = 1
+    local maxPen = cfg.maxTargets
+    local bulletRange = cfg.range
+
+    if stats then
+        fireRate = tonumber(stats:GetAttribute("FireRate")) or fireRate
+        pellets = tonumber(stats:GetAttribute("Pellets")) or pellets
+        local pen = tonumber(stats:GetAttribute("Penetration"))
+        if pen and pen > 1 then maxPen = math.min(maxPen, pen) end
+        local r = tonumber(stats:GetAttribute("BulletRange"))
+        if r and r > 0 then bulletRange = math.min(cfg.range, r) end
+    end
+
+    local currentAmmo = tonumber(gun:GetAttribute("Ammo"))
+    if currentAmmo and currentAmmo <= 0 then
+        if cfg.autoReload and reloadRemote and not aura.reloading then
+            aura.reloading = true
+            task.spawn(function()
+                pcall(function() reloadRemote:InvokeServer() end)
+                task.wait(1.5)
+                if syncRemote then pcall(function() syncRemote:FireServer() end) end
+                aura.reloading = false
+            end)
+        end
+        return
+    end
+
+    if now < aura.nextShot then return end
+
+    local targets = getTargets(hrp.Position, bulletRange)
+    if #targets == 0 then return end
+
+    local barrel = gun:FindFirstChild("Barrel")
+    local origin = (barrel and barrel.Position) or (hrp.Position + Vector3.new(0, 1.5, 0))
+
+    local hits = {}
+    local effects = {}
+    local count = math.min(#targets, maxPen)
+
+    for i = 1, count do
+        local t = targets[i]
+        table.insert(hits, {
+            HitChar  = t.model,
+            HitPos   = t.pos,
+            HitPart  = t.part,
+            Ricochet = (i > 1)
+        })
+        table.insert(effects, {
+            Origin = (i == 1) and origin or targets[i - 1].pos,
+            End    = t.pos
+        })
+    end
+
+    local primaryTarget = targets[1]
+    local bullets = {}
+    for i = 1, pellets do
+        bullets[i] = {
+            Target        = primaryTarget.pos,
+            HitData       = hits,
+            EffectResults = effects
+        }
+    end
+
+    if currentAmmo == aura.lastAmmo then
+        aura.stuckAmmo = aura.stuckAmmo + 1
+        if aura.stuckAmmo >= 4 then
+            aura.counter = aura.counter + 20
+            aura.stuckAmmo = 0
+        end
+    else
+        aura.stuckAmmo = 0
+        aura.lastAmmo = currentAmmo
+    end
+
+    aura.counter = aura.counter + 1
+    local delayTime = 60 / math.max(fireRate, 60)
+    aura.nextShot = now + delayTime
+
+    pcall(function()
+        shootRemote:FireServer(origin, bullets, 0, aura.counter)
+    end)
+end
+
+local parentGui = (gethui and gethui()) or game:GetService("CoreGui") or LocalPlayer:FindFirstChildOfClass("PlayerGui")
+local existing = parentGui:FindFirstChild("ApocSilentUI")
+if existing then existing:Destroy() end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "ApocSilentUI"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = parentGui
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 240, 0, 190)
+mainFrame.Position = UDim2.new(0, 50, 0.4, 0)
+mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = screenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 8)
+corner.Parent = mainFrame
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 32)
+title.BackgroundTransparency = 1
+title.Text = "Apocalypse Silent Aura [X]"
+title.TextColor3 = Color3.fromRGB(240, 240, 240)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.Parent = mainFrame
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(0.88, 0, 0, 32)
+toggleBtn.Position = UDim2.new(0.06, 0, 0.22, 0)
+toggleBtn.BackgroundColor3 = cfg.enabled and Color3.fromRGB(40, 180, 80) or Color3.fromRGB(180, 40, 40)
+toggleBtn.Text = "Kill Aura: " .. (cfg.enabled and "ENABLED" or "DISABLED")
+toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleBtn.Font = Enum.Font.GothamSemibold
+toggleBtn.TextSize = 12
+toggleBtn.Parent = mainFrame
+local bCorner = Instance.new("UICorner")
+bCorner.CornerRadius = UDim.new(0, 6)
+bCorner.Parent = toggleBtn
+
+local function updateUI()
+    toggleBtn.BackgroundColor3 = cfg.enabled and Color3.fromRGB(40, 180, 80) or Color3.fromRGB(180, 40, 40)
+    toggleBtn.Text = "Kill Aura: " .. (cfg.enabled and "ENABLED" or "DISABLED")
+end
+
+toggleBtn.MouseButton1Click:Connect(function()
+    cfg.enabled = not cfg.enabled
+    updateUI()
+end)
+
+local reloadBtn = Instance.new("TextButton")
+reloadBtn.Size = UDim2.new(0.88, 0, 0, 28)
+reloadBtn.Position = UDim2.new(0.06, 0, 0.44, 0)
+reloadBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+reloadBtn.Text = "Auto Reload: " .. (cfg.autoReload and "ON" or "OFF")
+reloadBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+reloadBtn.Font = Enum.Font.Gotham
+reloadBtn.TextSize = 11
+reloadBtn.Parent = mainFrame
+local rCorner = Instance.new("UICorner")
+rCorner.CornerRadius = UDim.new(0, 6)
+rCorner.Parent = reloadBtn
+
+reloadBtn.MouseButton1Click:Connect(function()
+    cfg.autoReload = not cfg.autoReload
+    reloadBtn.Text = "Auto Reload: " .. (cfg.autoReload and "ON" or "OFF")
+end)
+
+local distBtn = Instance.new("TextButton")
+distBtn.Size = UDim2.new(0.88, 0, 0, 28)
+distBtn.Position = UDim2.new(0.06, 0, 0.62, 0)
+distBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+distBtn.Text = "Range: " .. cfg.range .. " studs"
+distBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+distBtn.Font = Enum.Font.Gotham
+distBtn.TextSize = 11
+distBtn.Parent = mainFrame
+local dCorner = Instance.new("UICorner")
+dCorner.CornerRadius = UDim.new(0, 6)
+dCorner.Parent = distBtn
+
+distBtn.MouseButton1Click:Connect(function()
+    if cfg.range == 100 then cfg.range = 150
+    elseif cfg.range == 150 then cfg.range = 250
+    elseif cfg.range == 250 then cfg.range = 350
+    else cfg.range = 100 end
+    distBtn.Text = "Range: " .. cfg.range .. " studs"
+end)
+
+local statusLbl = Instance.new("TextLabel")
+statusLbl.Size = UDim2.new(1, 0, 0, 20)
+statusLbl.Position = UDim2.new(0, 0, 0.85, 0)
+statusLbl.BackgroundTransparency = 1
+statusLbl.Text = "Press [X] to Toggle"
+statusLbl.TextColor3 = Color3.fromRGB(140, 140, 150)
+statusLbl.Font = Enum.Font.Gotham
+statusLbl.TextSize = 10
+statusLbl.Parent = mainFrame
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if not gpe and input.KeyCode == cfg.toggleKey then
+        cfg.enabled = not cfg.enabled
+        updateUI()
+    end
+end)
+
+RunService.Heartbeat:Connect(function()
+    pcall(stepSilentKillAura)
+end)
